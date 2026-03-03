@@ -59,6 +59,74 @@ class FAM(nn.Module):
 def CharbonnierFunc(data, epsilon=0.001):
     return torch.mean(torch.sqrt(data ** 2 + epsilon ** 2))
 
+
+class WindTurbineMotionModule(nn.Module):
+    """Predicts a rotation-structured displacement field for wind turbine
+    motion deblurring.
+
+    Wind turbine blades rotate around a fixed hub. This module estimates
+    the rotation center (cx, cy) and rotation angle theta from feature maps,
+    then synthesizes a spatially-structured displacement field using the
+    small-angle rigid-rotation approximation:
+
+        dx(x, y) = -theta * (y - cy)
+        dy(x, y) =  theta * (x - cx)
+
+    The structured field captures the dominant rotational motion of the blades.
+    It is added to the residual displacement predicted by KernelPredictMotion,
+    which handles background / non-rotating regions (e.g. the tower).
+    """
+
+    def __init__(self, in_channels):
+        super(WindTurbineMotionModule, self).__init__()
+        self.gap = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(in_channels, in_channels // 2),
+            nn.ReLU(inplace=True),
+            nn.Linear(in_channels // 2, 3),  # (cx_norm, cy_norm, theta_norm)
+            nn.Tanh(),                        # bound outputs to [-1, 1]
+        )
+
+    def forward(self, feat):
+        """
+        Args:
+            feat: (B, C, H, W) decoder feature map.
+        Returns:
+            (B, 2, H, W) rotational displacement field (dx, dy) in pixel units.
+        """
+        B, C, H, W = feat.shape
+        params = self.fc(self.gap(feat).view(B, -1))  # (B, 3)
+
+        # Map normalized center coordinates to pixel space
+        cx = (params[:, 0] * 0.5 + 0.5) * W   # rotation center x in [0, W]
+        cy = (params[:, 1] * 0.5 + 0.5) * H   # rotation center y in [0, H]
+        # Scale theta: allows up to 0.3 rad (~17°) of rotation per frame,
+        # which covers typical wind-turbine motion-blur angles.
+        theta = params[:, 2] * 0.3
+
+        device = feat.device
+        dtype = feat.dtype
+        if 'indexing' in torch.meshgrid.__code__.co_varnames:
+            grid_y, grid_x = torch.meshgrid(
+                torch.arange(0, H, device=device, dtype=dtype),
+                torch.arange(0, W, device=device, dtype=dtype),
+                indexing='ij')
+        else:
+            grid_y, grid_x = torch.meshgrid(
+                torch.arange(0, H, device=device, dtype=dtype),
+                torch.arange(0, W, device=device, dtype=dtype))
+
+        cx = cx.view(B, 1, 1)
+        cy = cy.view(B, 1, 1)
+        theta = theta.view(B, 1, 1)
+
+        # Rotational displacement (small-angle approximation):
+        #   dx = -theta * (y - cy),  dy = theta * (x - cx)
+        dx = -theta * (grid_y.unsqueeze(0) - cy)  # (B, H, W)
+        dy =  theta * (grid_x.unsqueeze(0) - cx)  # (B, H, W)
+
+        return torch.stack([dx, dy], dim=1)  # (B, 2, H, W)
+
 def motion_warp(x,
                 motion,
                 interpolation='bilinear',
@@ -114,9 +182,11 @@ class MISCKernelNet(nn.Module):
                 num_blocks_kernel=[1,1,1],
                 kernel_size=7,
                 inference=False,
+                turbine_mode=False,
                 ):
         super(MISCKernelNet, self).__init__()
         self.inference = inference
+        self.turbine_mode = turbine_mode
         self.dim = dim
         self.kernel_size = kernel_size
         self.kernel_pad = int((self.kernel_size - 1) / 2.0)
@@ -183,6 +253,15 @@ class MISCKernelNet(nn.Module):
                 BasicConv(base_channel, 1, kernel_size=3, relu=False, stride=1),
         ])
         self.sigmoid = nn.Sigmoid()
+
+        if turbine_mode:
+            # One WindTurbineMotionModule per decoder scale, conditioned on
+            # features at that scale's channel width.
+            self.TurbineMotion = nn.ModuleList([
+                WindTurbineMotionModule(base_channel * 4),
+                WindTurbineMotionModule(base_channel * 2),
+                WindTurbineMotionModule(base_channel),
+            ])
 
 
         self.KernelOutBias = nn.ModuleList([
@@ -257,6 +336,8 @@ class MISCKernelNet(nn.Module):
         
 
         s3_kernal_motion = self.KernelPredictMotion[0](z)
+        if self.turbine_mode:
+            s3_kernal_motion = s3_kernal_motion + self.TurbineMotion[0](z)
         s3_kernal_motionmask = self.KernelPredictMotionMask[0](z)
         s3_kernal_motionmask = self.sigmoid(s3_kernal_motionmask)
 
@@ -297,6 +378,8 @@ class MISCKernelNet(nn.Module):
         z = self.Decoder[1](z)
 
         s2_kernal_motion = self.KernelPredictMotion[1](z) + self.motionup(s3_kernal_motion)*2
+        if self.turbine_mode:
+            s2_kernal_motion = s2_kernal_motion + self.TurbineMotion[1](z)
         s2_kernal_motionmask = self.KernelPredictMotionMask[1](z)
         s2_kernal_motionmask = self.sigmoid(s2_kernal_motionmask)
 
@@ -338,6 +421,8 @@ class MISCKernelNet(nn.Module):
         z = self.Decoder[2](z)
 
         s1_kernal_motion = self.KernelPredictMotion[2](z) + self.motionup(s2_kernal_motion)*2
+        if self.turbine_mode:
+            s1_kernal_motion = s1_kernal_motion + self.TurbineMotion[2](z)
         s1_kernal_motionmask = self.KernelPredictMotionMask[2](z)
         s1_kernal_motionmask = self.sigmoid(s1_kernal_motionmask)
 
