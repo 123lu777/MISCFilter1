@@ -59,17 +59,92 @@ class FAM(nn.Module):
 def CharbonnierFunc(data, epsilon=0.001):
     return torch.mean(torch.sqrt(data ** 2 + epsilon ** 2))
 
-def flow_warp(x,
-              flow,
-              interpolation='bilinear',
-              padding_mode='zeros',
-              align_corners=True):
-    if x.size()[-2:] != flow.size()[1:3]:
+
+class WindTurbineMotionModule(nn.Module):
+    """Predicts a rotation-structured displacement field for wind turbine
+    motion deblurring.
+
+    Wind turbine blades rotate around a fixed hub. This module estimates
+    the rotation center (cx, cy) and rotation angle theta from feature maps,
+    then synthesizes a spatially-structured displacement field using the
+    small-angle rigid-rotation approximation:
+
+        dx(x, y) = -theta * (y - cy)
+        dy(x, y) =  theta * (x - cx)
+
+    The structured field captures the dominant rotational motion of the blades.
+    It is added to the residual displacement predicted by KernelPredictMotion,
+    which handles background / non-rotating regions (e.g. the tower).
+    """
+
+    def __init__(self, in_channels):
+        super(WindTurbineMotionModule, self).__init__()
+        self.gap = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(in_channels, in_channels // 2),
+            nn.ReLU(inplace=True),
+            nn.Linear(in_channels // 2, 3),  # (cx_norm, cy_norm, theta_norm)
+            nn.Tanh(),                        # bound outputs to [-1, 1]
+        )
+
+    def forward(self, feat):
+        """
+        Args:
+            feat: (B, C, H, W) decoder feature map.
+        Returns:
+            (B, 2, H, W) rotational displacement field (dx, dy) in pixel units.
+        """
+        B, C, H, W = feat.shape
+        params = self.fc(self.gap(feat).view(B, -1))  # (B, 3)
+
+        # Map normalized center coordinates to pixel space
+        cx = (params[:, 0] * 0.5 + 0.5) * W   # rotation center x in [0, W]
+        cy = (params[:, 1] * 0.5 + 0.5) * H   # rotation center y in [0, H]
+        # Scale theta: allows up to 0.3 rad (~17°) of rotation per frame,
+        # which covers typical wind-turbine motion-blur angles.
+        theta = params[:, 2] * 0.3
+
+        device = feat.device
+        dtype = feat.dtype
+        if 'indexing' in torch.meshgrid.__code__.co_varnames:
+            grid_y, grid_x = torch.meshgrid(
+                torch.arange(0, H, device=device, dtype=dtype),
+                torch.arange(0, W, device=device, dtype=dtype),
+                indexing='ij')
+        else:
+            grid_y, grid_x = torch.meshgrid(
+                torch.arange(0, H, device=device, dtype=dtype),
+                torch.arange(0, W, device=device, dtype=dtype))
+
+        cx = cx.view(B, 1, 1)
+        cy = cy.view(B, 1, 1)
+        theta = theta.view(B, 1, 1)
+
+        # Rotational displacement (small-angle approximation):
+        #   dx = -theta * (y - cy),  dy = theta * (x - cx)
+        dx = -theta * (grid_y.unsqueeze(0) - cy)  # (B, H, W)
+        dy =  theta * (grid_x.unsqueeze(0) - cx)  # (B, H, W)
+
+        return torch.stack([dx, dy], dim=1)  # (B, 2, H, W)
+
+def motion_warp(x,
+                motion,
+                interpolation='bilinear',
+                padding_mode='zeros',
+                align_corners=True):
+    """Warp features using a predicted displacement field.
+
+    Note: This is NOT true optical flow (which estimates inter-frame motion
+    between two consecutive video frames). The displacement field here is
+    estimated from a single blurry image to guide kernel parameter prediction
+    for motion deblurring.
+    """
+    if x.size()[-2:] != motion.size()[1:3]:
         raise ValueError(f'The spatial sizes of input ({x.size()[-2:]}) and '
-                         f'flow ({flow.size()[1:3]}) are not the same.')
+                         f'motion ({motion.size()[1:3]}) are not the same.')
     _, _, h, w = x.size()
     # create mesh grid
-    device = flow.device
+    device = motion.device
 
     if 'indexing' in torch.meshgrid.__code__.co_varnames:
         grid_y, grid_x = torch.meshgrid(
@@ -83,15 +158,15 @@ def flow_warp(x,
     grid = torch.stack((grid_x, grid_y), 2)  # h, w, 2
     grid.requires_grad = False
 
-    grid_flow = grid + flow
-    # scale grid_flow to [-1,1]
-    grid_flow_x = 2.0 * grid_flow[:, :, :, 0] / max(w - 1, 1) - 1.0
-    grid_flow_y = 2.0 * grid_flow[:, :, :, 1] / max(h - 1, 1) - 1.0
-    grid_flow = torch.stack((grid_flow_x, grid_flow_y), dim=3)
-    grid_flow = grid_flow.type(x.type())
+    grid_motion = grid + motion
+    # scale grid_motion to [-1,1]
+    grid_motion_x = 2.0 * grid_motion[:, :, :, 0] / max(w - 1, 1) - 1.0
+    grid_motion_y = 2.0 * grid_motion[:, :, :, 1] / max(h - 1, 1) - 1.0
+    grid_motion = torch.stack((grid_motion_x, grid_motion_y), dim=3)
+    grid_motion = grid_motion.type(x.type())
     output = F.grid_sample(
         x,
-        grid_flow,
+        grid_motion,
         mode=interpolation,
         padding_mode=padding_mode,
         align_corners=align_corners)
@@ -107,9 +182,11 @@ class MISCKernelNet(nn.Module):
                 num_blocks_kernel=[1,1,1],
                 kernel_size=7,
                 inference=False,
+                turbine_mode=False,
                 ):
         super(MISCKernelNet, self).__init__()
         self.inference = inference
+        self.turbine_mode = turbine_mode
         self.dim = dim
         self.kernel_size = kernel_size
         self.kernel_pad = int((self.kernel_size - 1) / 2.0)
@@ -161,19 +238,30 @@ class MISCKernelNet(nn.Module):
         self.modulePad = torch.nn.ReplicationPad2d([self.kernel_pad, self.kernel_pad, self.kernel_pad, self.kernel_pad])
         self.moduleKernel = misckernel.FunctionKernel.apply
 
-        self.KernelPredictFlow = nn.ModuleList([
+        # Predicts single-image displacement fields (not true inter-frame
+        # optical flow) used to warp features for kernel parameter estimation.
+        self.KernelPredictMotion = nn.ModuleList([
                 BasicConv(base_channel * 4, 2, kernel_size=3, relu=False, stride=1),
                 BasicConv(base_channel * 2, 2, kernel_size=3, relu=False, stride=1),
                 BasicConv(base_channel, 2, kernel_size=3, relu=False, stride=1),
         ])
-        self.flowup = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        self.motionup = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
 
-        self.KernelPredictFlowMask = nn.ModuleList([
+        self.KernelPredictMotionMask = nn.ModuleList([
                 BasicConv(base_channel * 4, 1, kernel_size=3, relu=False, stride=1),
                 BasicConv(base_channel * 2, 1, kernel_size=3, relu=False, stride=1),
                 BasicConv(base_channel, 1, kernel_size=3, relu=False, stride=1),
         ])
         self.sigmoid = nn.Sigmoid()
+
+        if turbine_mode:
+            # One WindTurbineMotionModule per decoder scale, conditioned on
+            # features at that scale's channel width.
+            self.TurbineMotion = nn.ModuleList([
+                WindTurbineMotionModule(base_channel * 4),
+                WindTurbineMotionModule(base_channel * 2),
+                WindTurbineMotionModule(base_channel),
+            ])
 
 
         self.KernelOutBias = nn.ModuleList([
@@ -247,18 +335,20 @@ class MISCKernelNet(nn.Module):
         z = self.Decoder[0](z)
         
 
-        s3_kernal_flow = self.KernelPredictFlow[0](z)
-        s3_kernal_flowmask = self.KernelPredictFlowMask[0](z)
-        s3_kernal_flowmask = self.sigmoid(s3_kernal_flowmask)
+        s3_kernal_motion = self.KernelPredictMotion[0](z)
+        if self.turbine_mode:
+            s3_kernal_motion = s3_kernal_motion + self.TurbineMotion[0](z)
+        s3_kernal_motionmask = self.KernelPredictMotionMask[0](z)
+        s3_kernal_motionmask = self.sigmoid(s3_kernal_motionmask)
 
         zx4 = torch.cat([z,x_4],1)
-        s3_kernal_flowfeat0,x_4_0  = torch.split(flow_warp(zx4, s3_kernal_flow.permute(0, 2, 3, 1)), self.dim * 4 , dim=1)
-        s3_kernal_flowfeat1,x_4_1 = torch.split(flow_warp(zx4, -s3_kernal_flow.permute(0, 2, 3, 1)), self.dim * 4 , dim=1)
-        x_4 = x_4_0 * s3_kernal_flowmask + x_4_1 * (1-s3_kernal_flowmask)
+        s3_kernal_motionfeat0,x_4_0  = torch.split(motion_warp(zx4, s3_kernal_motion.permute(0, 2, 3, 1)), self.dim * 4 , dim=1)
+        s3_kernal_motionfeat1,x_4_1 = torch.split(motion_warp(zx4, -s3_kernal_motion.permute(0, 2, 3, 1)), self.dim * 4 , dim=1)
+        x_4 = x_4_0 * s3_kernal_motionmask + x_4_1 * (1-s3_kernal_motionmask)
 
         s3_kernal_bias = self.KernelOutBias[0](z)
 
-        z = torch.cat([z, s3_kernal_flowfeat0 * s3_kernal_flowmask + s3_kernal_flowfeat1 * (1-s3_kernal_flowmask)],1)
+        z = torch.cat([z, s3_kernal_motionfeat0 * s3_kernal_motionmask + s3_kernal_motionfeat1 * (1-s3_kernal_motionmask)],1)
         s3_kernal_weight = self.KernelOutWeight[0](z)
         s3_kernal_weight = self.softmax(s3_kernal_weight)
         s3_kernal_alpha = self.KernelOutAlpha[0](z)
@@ -287,18 +377,20 @@ class MISCKernelNet(nn.Module):
         z = self.Convs[0](z)
         z = self.Decoder[1](z)
 
-        s2_kernal_flow = self.KernelPredictFlow[1](z) + self.flowup(s3_kernal_flow)*2
-        s2_kernal_flowmask = self.KernelPredictFlowMask[1](z)
-        s2_kernal_flowmask = self.sigmoid(s2_kernal_flowmask)
+        s2_kernal_motion = self.KernelPredictMotion[1](z) + self.motionup(s3_kernal_motion)*2
+        if self.turbine_mode:
+            s2_kernal_motion = s2_kernal_motion + self.TurbineMotion[1](z)
+        s2_kernal_motionmask = self.KernelPredictMotionMask[1](z)
+        s2_kernal_motionmask = self.sigmoid(s2_kernal_motionmask)
 
         zx2 = torch.cat([z,x_2],1)
-        s2_kernal_flowfeat0,x_2_0  = torch.split(flow_warp(zx2, s2_kernal_flow.permute(0, 2, 3, 1)), self.dim * 2 , dim=1)
-        s2_kernal_flowfeat1,x_2_1 = torch.split(flow_warp(zx2, -s2_kernal_flow.permute(0, 2, 3, 1)), self.dim * 2 , dim=1)
-        x_2 = x_2_0 * s2_kernal_flowmask + x_2_1 * (1-s2_kernal_flowmask)
+        s2_kernal_motionfeat0,x_2_0  = torch.split(motion_warp(zx2, s2_kernal_motion.permute(0, 2, 3, 1)), self.dim * 2 , dim=1)
+        s2_kernal_motionfeat1,x_2_1 = torch.split(motion_warp(zx2, -s2_kernal_motion.permute(0, 2, 3, 1)), self.dim * 2 , dim=1)
+        x_2 = x_2_0 * s2_kernal_motionmask + x_2_1 * (1-s2_kernal_motionmask)
 
         s2_kernal_bias = self.KernelOutBias[1](z)
 
-        z = torch.cat([z, s2_kernal_flowfeat0 * s2_kernal_flowmask + s2_kernal_flowfeat1 * (1-s2_kernal_flowmask)],1)
+        z = torch.cat([z, s2_kernal_motionfeat0 * s2_kernal_motionmask + s2_kernal_motionfeat1 * (1-s2_kernal_motionmask)],1)
         s2_kernal_weight = self.KernelOutWeight[1](z)
         s2_kernal_weight = self.softmax(s2_kernal_weight)
         s2_kernal_alpha = self.KernelOutAlpha[1](z)
@@ -328,17 +420,19 @@ class MISCKernelNet(nn.Module):
 
         z = self.Decoder[2](z)
 
-        s1_kernal_flow = self.KernelPredictFlow[2](z) + self.flowup(s2_kernal_flow)*2
-        s1_kernal_flowmask = self.KernelPredictFlowMask[2](z)
-        s1_kernal_flowmask = self.sigmoid(s1_kernal_flowmask)
+        s1_kernal_motion = self.KernelPredictMotion[2](z) + self.motionup(s2_kernal_motion)*2
+        if self.turbine_mode:
+            s1_kernal_motion = s1_kernal_motion + self.TurbineMotion[2](z)
+        s1_kernal_motionmask = self.KernelPredictMotionMask[2](z)
+        s1_kernal_motionmask = self.sigmoid(s1_kernal_motionmask)
 
         zx = torch.cat([z,x],1)
-        s1_kernal_flowfeat0,x_0  = torch.split(flow_warp(zx, s1_kernal_flow.permute(0, 2, 3, 1)), self.dim , dim=1)
-        s1_kernal_flowfeat1,x_1 = torch.split(flow_warp(zx, -s1_kernal_flow.permute(0, 2, 3, 1)), self.dim , dim=1)
-        x = x_0 * s1_kernal_flowmask + x_1 * (1-s1_kernal_flowmask)
+        s1_kernal_motionfeat0,x_0  = torch.split(motion_warp(zx, s1_kernal_motion.permute(0, 2, 3, 1)), self.dim , dim=1)
+        s1_kernal_motionfeat1,x_1 = torch.split(motion_warp(zx, -s1_kernal_motion.permute(0, 2, 3, 1)), self.dim , dim=1)
+        x = x_0 * s1_kernal_motionmask + x_1 * (1-s1_kernal_motionmask)
 
         s1_kernal_bias = self.KernelOutBias[2](z)
-        z = torch.cat([z, s1_kernal_flowfeat0 * s1_kernal_flowmask + s1_kernal_flowfeat1 * (1-s1_kernal_flowmask)],1)
+        z = torch.cat([z, s1_kernal_motionfeat0 * s1_kernal_motionmask + s1_kernal_motionfeat1 * (1-s1_kernal_motionmask)],1)
         s1_kernal_weight = self.KernelOutWeight[2](z)
         s1_kernal_weight = self.softmax(s1_kernal_weight)
         s1_kernal_alpha = self.KernelOutAlpha[2](z)

@@ -16,6 +16,8 @@ This is the official PyTorch implementation of the paper [Motion-adaptive Separa
 ## Overview
 <img src="./fig/overview.jpg" width=100%>
 
+> **Note on motion estimation:** The model uses a learned displacement-field predictor (`KernelPredictMotion`) that is inspired by optical flow but is **not** true optical flow. True optical flow estimates inter-frame pixel motion between two consecutive video frames. In contrast, `KernelPredictMotion` estimates a spatial displacement field from a **single blurry image** at each decoder scale. This displacement is used purely to warp internal features and the input image, guiding the kernel parameter prediction for motion deblurring—it does not represent temporal motion between frames.
+
 ## Contribution
 * We propose a novel real-world deblurring filtering model called the Motion-adaptive Separable Collaborative (MISC) Filter. It targets the shortcomings of existing methods that focus only on image residual reconstruction in feature space and can handle more generalized and complex motion in image space.
 * We analyze the relationship between the motion estimation network for producing filter parameters and the residual reconstruction network to maximize model efficiency.
@@ -129,6 +131,46 @@ cd MISCFilter
 python train_RealBlur_J.py
 ```
 4. The models are saved in `./experiments`
+
+## Wind Turbine Deblurring
+
+Wind turbine blades produce a characteristic **rotational motion blur** around a fixed hub center. MISCFilter includes a dedicated mode that adds a physics-informed `WindTurbineMotionModule` to the displacement-field prediction at each decoder scale.
+
+### How it works
+
+At each decoder scale the module:
+1. Globally pools the feature map and predicts three parameters: normalized rotation center (cx, cy) and rotation angle θ.
+2. Synthesizes a spatially-structured displacement field via the small-angle rotation approximation:
+
+   ```
+   dx(x, y) = -θ · (y − cy)
+   dy(x, y) =  θ · (x − cx)
+   ```
+
+3. Adds this structured field **on top of** the residual displacement predicted by `KernelPredictMotion`, so that the residual branch handles background / non-rotating regions (e.g. the tower or the sky).
+
+This inductive bias constrains the motion field to be physically consistent with rotational dynamics, reducing the parameter search space and improving deblurring of rotating blades.
+
+### Training
+
+1. Prepare a paired wind-turbine dataset (blurry / sharp image pairs) and create train / test list files.
+2. Update `--train_dir`, `--train_meta`, `--val_dir`, `--val_meta` in `./train_WindTurbine.py`.
+3. Run training:
+```
+python train_WindTurbine.py
+```
+
+### Instantiating the turbine model in code
+
+```python
+from models.MISCFilterNet import MISCKernelNet
+
+# Standard model (general deblurring)
+model = MISCKernelNet()
+
+# Wind-turbine model (adds rotational motion prior)
+model = MISCKernelNet(turbine_mode=True)
+```
 
 ## Citation
 If you find the code and pre-trained models useful for your research, please consider citing our paper. :blush:
