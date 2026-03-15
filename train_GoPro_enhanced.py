@@ -1,39 +1,29 @@
 """
 train_GoPro_enhanced.py
 -----------------------
-Enhanced three-stage training script for the MISCFilter blade deblurring model.
+MISCFilter 叶片去模糊 – 一键三步训练脚本
+=========================================
 
-Default mode (--stage all)
-~~~~~~~~~~~~~~~~~~~~~~~~~~
-Run once and the script automatically handles all three steps:
+使用方法（无需终端）
+--------------------
+1. 在下方「用户配置」区域填写你的路径和参数。
+2. 在 VSCode / PyCharm 中右键此文件 → "运行 Python 文件"即可。
+   脚本会自动依次完成：
+     Step 1 – 从视频生成配对数据集（若已有数据集可跳过，保持 video_dir = None）
+     Step 2 – 预训练（~70 epoch，视频合成配对数据）
+     Step 3 – 微调  （~15 epoch，真实模糊图片，低学习率）
 
-  Step 1 – Dataset building  (only when --video_dir is given)
-  Step 2 – Pre-training      (~70 epochs on video-synthesised pairs)
-  Step 3 – Fine-tuning       (~15 epochs on real blur images at a low LR)
-
-Simplest usage – just run:
-
-    python train_GoPro_enhanced.py \\
-        --video_dir  /path/to/videos \\
-        --output_dir ./dataset/blade \\
-        --blur_dir   /path/to/blur_images   # optional
-
-    # No videos yet? Put pairs directly in output_dir and skip video_dir:
-    python train_GoPro_enhanced.py --output_dir ./dataset/blade
-
-Individual stages can still be run separately:
-
-    python train_GoPro_enhanced.py --stage pretrain  --output_dir ./dataset/blade
-    python train_GoPro_enhanced.py --stage finetune  --output_dir ./dataset/blade \\
-        --pretrain_ckpt ./checkpoints/blade/MISCFilter_blade_pretrain/model_best.pth
-    python train_GoPro_enhanced.py --stage eval      --output_dir ./dataset/blade \\
-        --pretrain_ckpt ./checkpoints/blade/MISCFilter_blade_finetune/model_best.pth
+只运行单个阶段
+--------------
+将 stage 改为 'pretrain'、'finetune' 或 'eval' 即可。
+  - 'finetune' / 'eval' 时需填写 pretrain_ckpt。
 """
 
 import os
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 os.environ["CUDA_VISIBLE_DEVICES"] = '0,1,2,3,4,5,6,7'
 
+import types
 import torch
 torch.backends.cudnn.benchmark = True
 
@@ -55,7 +45,6 @@ from loss.temporal_consistency_loss import TemporalConsistencyLoss
 from warmup_scheduler import GradualWarmupScheduler
 from tools.get_parameter_number import get_parameter_number
 import kornia
-import argparse
 
 ######### Reproducibility ###########
 random.seed(1234)
@@ -63,104 +52,75 @@ np.random.seed(1234)
 torch.manual_seed(1234)
 torch.cuda.manual_seed_all(1234)
 
-# ---------------------------------------------------------------------------
-# Argument parsing
-# ---------------------------------------------------------------------------
+# ===========================================================================
+#  用户配置区  ★ 只需修改这里，然后右键运行即可 ★
+# ===========================================================================
 
-parser = argparse.ArgumentParser(
-    description='Enhanced Blade Deblurring – run once to build dataset, '
-                'pre-train and fine-tune (--stage all, the default).',
-    formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+args = types.SimpleNamespace(
+
+    # ── Step 1：数据集构建 ──────────────────────────────────────────────────
+    # 有视频文件时填写 video_dir，脚本自动抽帧并生成配对数据集。
+    # 数据集已存在时保持 video_dir = None，直接读取 output_dir 中的文件。
+    video_dir       = None,              # 示例: r'D:\blade_videos'
+    output_dir      = './dataset/blade', # 数据集根目录（生成或已有）
+    blur_dir        = None,              # 可选：真实模糊图目录（无GT）
+                                         # 示例: r'D:\real_blur'
+    sample_fps      = 3.0,   # 视频抽帧帧率
+    sharp_pct       = 0.30,  # Tenengrad筛选：保留最清晰的前30%帧
+    n_blur_steps    = 8,     # 模糊合成积分步数
+    exposure_factor = 1.0,   # 曝光缩放系数
+    val_ratio       = 0.1,   # 验证集比例
+    blade_roi       = None,  # 可选叶片ROI裁剪，示例: [x1, y1, x2, y2]
+
+    # ── 数据路径（已有数据集时可覆盖；通常保持 None 自动推断） ──────────────
+    train_dir  = None,  # 默认等于 output_dir
+    train_meta = None,  # 默认: <output_dir>/blade_train_list.txt
+    val_dir    = None,  # 默认等于 output_dir
+    val_meta   = None,  # 默认: <output_dir>/blade_val_list.txt
+    flow_dir   = None,  # 预计算光流 .npy 文件目录（可选）
+
+    # ── 检查点 ──────────────────────────────────────────────────────────────
+    model_save_dir = './checkpoints',
+    # stage='finetune'/'eval' 时，填写预训练权重路径；stage='all' 时自动传递
+    pretrain_ckpt  = '',  # 示例: './checkpoints/blade/MISCFilter_blade_pretrain/model_best.pth'
+    resume_ckpt    = '',  # 断点续训（可选）
+
+    # ── 训练阶段 ─────────────────────────────────────────────────────────────
+    # 'all'      → Step1（若 video_dir 非空）+ 预训练 + 微调  ← 推荐
+    # 'pretrain' → 仅预训练
+    # 'finetune' → 仅微调（需填写 pretrain_ckpt）
+    # 'eval'     → 仅评估（需填写 pretrain_ckpt）
+    stage           = 'all',
+
+    dataset         = 'blade',
+    session         = 'MISCFilter_blade',
+    patch_size      = 256,
+    pretrain_epochs = 70,   # 预训练轮数
+    finetune_epochs = 15,   # 微调轮数
+    num_epochs      = None, # 单阶段运行时覆盖上方轮数（None=使用上方默认值）
+    batch_size      = 8,
+    val_epochs      = 5,    # 每隔多少 epoch 做一次验证
+    print_epochs    = 1,    # 每隔多少 epoch 打印一次日志
+    warmup_epochs   = 3,    # 学习率热身轮数
+
+    # ── 学习率 ───────────────────────────────────────────────────────────────
+    start_lr    = 2e-4,  # 预训练初始学习率
+    end_lr      = 1e-6,  # CosineAnnealing 最小学习率
+    finetune_lr = 1e-5,  # 微调学习率
+
+    # ── 损失权重 ─────────────────────────────────────────────────────────────
+    w_motion   = 0.05,
+    w_temporal = 0.05,
+    w_physics  = 0.01,
+
+    # ── 数据加载模式 ─────────────────────────────────────────────────────────
+    # 'blade' = 光流感知加载器（推荐）   'gopro' = 原始GoPro加载器
+    data_mode = 'blade',
 )
 
-# ---- Dataset building (Step 1) ----
-build_grp = parser.add_argument_group('Dataset building (Step 1)')
-build_grp.add_argument('--video_dir',  default=None, type=str,
-                        help='Directory of blade videos. '
-                             'When given, a paired dataset is built automatically.')
-build_grp.add_argument('--output_dir', default='./dataset/blade', type=str,
-                        help='Root directory for the generated / existing dataset.')
-build_grp.add_argument('--blur_dir',   default=None, type=str,
-                        help='Optional directory of real blurry images (no GT). '
-                             'Appended to the training split for semi-supervised use.')
-build_grp.add_argument('--sample_fps',      type=float, default=3.0,
-                        help='Frame-sampling rate used when extracting video frames.')
-build_grp.add_argument('--sharp_pct',       type=float, default=0.30,
-                        help='Top fraction of frames kept as GT (Tenengrad filter).')
-build_grp.add_argument('--n_blur_steps',    type=int,   default=8,
-                        help='Number of integration steps for blur synthesis.')
-build_grp.add_argument('--exposure_factor', type=float, default=1.0,
-                        help='Exposure scale factor for blur synthesis.')
-build_grp.add_argument('--val_ratio',       type=float, default=0.1,
-                        help='Fraction of pairs reserved for validation.')
-build_grp.add_argument('--blade_roi', type=int, nargs=4, default=None,
-                        metavar=('X1', 'Y1', 'X2', 'Y2'),
-                        help='Optional blade ROI crop applied before flow extraction.')
-
-# ---- Paths (used when dataset already exists) ----
-path_grp = parser.add_argument_group('Data paths (used when dataset already exists)')
-path_grp.add_argument('--train_dir',  default=None, type=str,
-                       help='Training data root. Defaults to --output_dir.')
-path_grp.add_argument('--train_meta', default=None, type=str,
-                       help='Training meta list. Defaults to <output_dir>/blade_train_list.txt.')
-path_grp.add_argument('--val_dir',    default=None, type=str,
-                       help='Validation data root. Defaults to --output_dir.')
-path_grp.add_argument('--val_meta',   default=None, type=str,
-                       help='Validation meta list. Defaults to <output_dir>/blade_val_list.txt.')
-path_grp.add_argument('--flow_dir',   default=None, type=str,
-                       help='Optional directory of pre-computed .npy optical-flow files.')
-
-# ---- Checkpoints ----
-ckpt_grp = parser.add_argument_group('Checkpoints')
-ckpt_grp.add_argument('--model_save_dir', default='./checkpoints', type=str)
-ckpt_grp.add_argument('--pretrain_ckpt',  default='', type=str,
-                       help='Pre-trained checkpoint to load at the start of the '
-                            'finetune stage.  In --stage all mode this is set '
-                            'automatically from the pretrain best checkpoint.')
-ckpt_grp.add_argument('--resume_ckpt',    default='', type=str,
-                       help='Resume a single stage from this checkpoint.')
-
-# ---- Stage / training ----
-train_grp = parser.add_argument_group('Training')
-train_grp.add_argument('--stage', default='all', type=str,
-                        choices=['all', 'pretrain', 'finetune', 'eval'],
-                        help='"all" (default) runs Step1→pretrain→finetune sequentially. '
-                             'Individual stages can still be run separately.')
-train_grp.add_argument('--dataset',     default='blade',              type=str)
-train_grp.add_argument('--session',     default='MISCFilter_blade',   type=str)
-train_grp.add_argument('--patch_size',  default=256,  type=int)
-train_grp.add_argument('--pretrain_epochs', default=70,  type=int,
-                        help='Epochs for the pretrain stage.')
-train_grp.add_argument('--finetune_epochs', default=15,  type=int,
-                        help='Epochs for the finetune stage.')
-train_grp.add_argument('--num_epochs',  default=None, type=int,
-                        help='Override epoch count for a single stage run '
-                             '(--stage pretrain/finetune/eval).')
-train_grp.add_argument('--batch_size',    default=8,  type=int)
-train_grp.add_argument('--val_epochs',    default=5,  type=int)
-train_grp.add_argument('--print_epochs',  default=1,  type=int)
-train_grp.add_argument('--warmup_epochs', default=3,  type=int,
-                        help='Number of LR warm-up epochs at the start of each stage.')
-
-# ---- Learning rates ----
-lr_grp = parser.add_argument_group('Learning rates')
-lr_grp.add_argument('--start_lr',    default=2e-4, type=float)
-lr_grp.add_argument('--end_lr',      default=1e-6, type=float)
-lr_grp.add_argument('--finetune_lr', default=1e-5, type=float,
-                     help='Learning rate for the finetune stage.')
-
-# ---- Loss weights ----
-loss_grp = parser.add_argument_group('Loss weights')
-loss_grp.add_argument('--w_motion',   default=0.05, type=float)
-loss_grp.add_argument('--w_temporal', default=0.05, type=float)
-loss_grp.add_argument('--w_physics',  default=0.01, type=float)
-
-# ---- Data mode ----
-parser.add_argument('--data_mode', default='blade', type=str,
-                    choices=['blade', 'gopro'],
-                    help='"blade" loads optical flow labels; "gopro" is the original mode.')
-
-args = parser.parse_args()
+# ===========================================================================
+#  配置结束  ★ 以下内容无需修改 ★
+# ===========================================================================
 
 # ---------------------------------------------------------------------------
 # Resolve output/data paths
