@@ -116,15 +116,17 @@ def build_full_dataset(video_dir: str,
     """Build a complete paired dataset from videos (and optional blur images).
 
     Args:
-        video_dir:          Directory containing video files.
+        video_dir:          Path to a single video file **or** a directory of
+                            video files.
         output_dir:         Root output directory.
         blur_dir:           Optional directory of real blurry images (no GT).
-        sample_fps:         Frame sampling rate.
-        sharp_top_percent:  Top fraction of frames to keep as GT.
-        blade_roi:          Optional blade ROI crop.
+        sample_fps:         Frame sampling rate (frames per second).
+        sharp_top_percent:  Top fraction of frames to keep as GT
+                            (Tenengrad sharpness filter).
+        blade_roi:          Optional blade ROI crop (x1, y1, x2, y2).
         n_blur_steps:       Blur synthesis integration steps.
-        exposure_factor:    Exposure scale factor.
-        val_ratio:          Fraction for validation split.
+        exposure_factor:    Exposure scale factor applied to the flow magnitude.
+        val_ratio:          Fraction of pairs to use for the validation split.
 
     Returns:
         (train_meta_path, val_meta_path)
@@ -157,7 +159,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(
         description='Build blade deblurring dataset from videos')
     parser.add_argument('--video_dir',   required=True,
-                        help='Directory of blade video files')
+                        help='Single video file or directory of blade video files')
     parser.add_argument('--output_dir',  required=True,
                         help='Output dataset root directory')
     parser.add_argument('--blur_dir',    default=None,

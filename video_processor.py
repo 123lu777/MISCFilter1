@@ -265,27 +265,33 @@ def build_dataset_from_videos(video_dir: str,
                               n_blur_steps: int = 8,
                               exposure_factor: float = 1.0
                               ) -> str:
-    """Process all videos in *video_dir* and write a meta-list file.
+    """Process videos and write a meta-list file.
 
     Args:
-        video_dir:         Directory containing video files.
+        video_dir:         Path to a single video file **or** a directory that
+                           contains video files.  When a directory is given,
+                           all video files found in it are processed.
         output_dir:        Root output directory.
-        sample_fps:        Frame sampling rate.
-        sharp_top_percent: Top fraction kept as GT.
-        blade_roi:         Optional blade crop ROI.
-        n_blur_steps:      Blur integration steps.
-        exposure_factor:   Exposure scale factor.
+        sample_fps:        Frame sampling rate (frames per second).
+        sharp_top_percent: Top fraction of frames kept as GT.
+        blade_roi:         Optional blade crop ROI (x1, y1, x2, y2).
+        n_blur_steps:      Blur synthesis integration steps.
+        exposure_factor:   Exposure scale factor applied to the flow magnitude.
 
     Returns:
         Path to the generated meta-list file (one line per pair:
         ``sharp_rel_path blur_rel_path``).
     """
     video_exts = {'.mp4', '.avi', '.mov', '.mkv', '.MP4', '.AVI', '.MOV'}
-    video_files = [
-        os.path.join(video_dir, f)
-        for f in sorted(os.listdir(video_dir))
-        if os.path.splitext(f)[1] in video_exts
-    ]
+    if os.path.isfile(video_dir):
+        # Single video file passed directly
+        video_files = [video_dir]
+    else:
+        video_files = [
+            os.path.join(video_dir, f)
+            for f in sorted(os.listdir(video_dir))
+            if os.path.splitext(f)[1] in video_exts
+        ]
 
     all_pairs = []
     for vf in video_files:
@@ -320,7 +326,7 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser(
         description='Build paired blade deblurring dataset from videos')
-    parser.add_argument('--video_dir',   required=True, help='Directory of blade videos')
+    parser.add_argument('--video_dir',   required=True, help='Single video file or directory of blade videos')
     parser.add_argument('--output_dir',  required=True, help='Output dataset directory')
     parser.add_argument('--sample_fps',  type=float, default=3.0)
     parser.add_argument('--sharp_pct',   type=float, default=0.30,
