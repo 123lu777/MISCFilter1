@@ -1,0 +1,17 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Build artifacts
+*.egg-info/
+dist/
+build/
+
+# Checkpoints & results
+checkpoints/
+results/
+
+# Dataset directories (generated)
+dataset/blade/
