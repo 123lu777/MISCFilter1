@@ -11,7 +11,7 @@ MISCFilter 叶片去模糊 – 一键三步训练脚本
    脚本会自动依次完成：
      Step 1 – 从视频生成配对数据集（若已有数据集可跳过，保持 video_dir = None）
      Step 2 – 预训练（~70 epoch，视频合成配对数据）
-     Step 3 – 微调  （~15 epoch，真实模糊图片，低学习率）
+     Step 3 – 微调  （~20 epoch，真实模糊图片，低学习率）
 
 只运行单个阶段
 --------------
@@ -137,11 +137,11 @@ args = types.SimpleNamespace(
     output_dir      = './dataset/blade', # 数据集根目录（生成或已有）
     blur_dir        = None,              # 可选：真实模糊图目录（无GT）
                                          # 示例: r'D:\real_blur'
-    sample_fps      = 3.0,   # 视频抽帧帧率
-    sharp_pct       = 0.30,  # Tenengrad筛选：保留最清晰的前30%帧
-    n_blur_steps    = 8,     # 模糊合成积分步数
-    exposure_factor = 1.0,   # 曝光缩放系数
-    val_ratio       = 0.1,   # 验证集比例
+    sample_fps      = 25.0,  # 视频抽帧帧率（风机叶片高速旋转，高帧率保留更多运动细节）
+    sharp_pct       = 0.30,  # Tenengrad筛选：保留最清晰的前30%帧（必须为0~1之间的小数）
+    n_blur_steps    = 5,     # 模糊合成积分步数（3太低，8对高速叶片过高；5为折中）
+    exposure_factor = 0.05,  # 曝光缩放系数（风机叶片运动极快，小曝光因子避免过度模糊）
+    val_ratio       = 0.2,   # 验证集比例（更大的验证集有助于评估泛化能力）
     blade_roi       = None,  # 可选叶片ROI裁剪，示例: [x1, y1, x2, y2]
 
     # ── 数据路径（已有数据集时可覆盖；通常保持 None 自动推断） ──────────────
@@ -168,11 +168,11 @@ args = types.SimpleNamespace(
     session         = 'MISCFilter_blade',
     patch_size      = 256,
     pretrain_epochs = 70,   # 预训练轮数
-    finetune_epochs = 15,   # 微调轮数
+    finetune_epochs = 20,   # 微调轮数（充分的微调提升叶片真实模糊适应性）
     num_epochs      = None, # 单阶段运行时覆盖上方轮数（None=使用上方默认值）
-    batch_size      = 8,
+    batch_size      = 16,   # 批次大小（更大的批次改善梯度估计稳定性）
     val_epochs      = 5,    # 每隔多少 epoch 做一次验证
-    print_epochs    = 1,    # 每隔多少 epoch 打印一次日志
+    print_epochs    = 2,    # 每隔多少 epoch 打印一次日志
     warmup_epochs   = 3,    # 学习率热身轮数
 
     # ── 学习率 ───────────────────────────────────────────────────────────────
@@ -183,7 +183,7 @@ args = types.SimpleNamespace(
     # ── 损失权重 ─────────────────────────────────────────────────────────────
     w_motion   = 0.05,
     w_temporal = 0.05,
-    w_physics  = 0.01,
+    w_physics  = 0.03,  # 叶片旋转物理约束更强（旋转运动约束对风机尤为重要）
 
     # ── 数据加载模式 ─────────────────────────────────────────────────────────
     # 'blade' = 光流感知加载器（推荐）   'gopro' = 原始GoPro加载器

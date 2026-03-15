@@ -118,6 +118,11 @@ def select_sharp_frames(frames: List[np.ndarray],
         indices:       Original indices in *frames*.
     """
     fn = tenengrad_sharpness if metric == 'tenengrad' else laplacian_sharpness
+    if top_percent > 1.0:
+        raise ValueError(
+            f"select_sharp_frames: top_percent must be a fraction between 0 and 1 "
+            f"(got {top_percent}). Did you mean {top_percent / 100:.2f} instead of {top_percent}?"
+        )
     scored = [(fn(f), i, f) for i, f in enumerate(frames)]
     scored.sort(key=lambda x: x[0], reverse=True)
     n_keep = max(1, int(math.ceil(len(scored) * top_percent)))
